@@ -1,0 +1,432 @@
+---
+title: "Hyp3"
+output: html_document
+date: "2025-12-19"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+# Diverse filepaths
+filsti_Mikkel <- "C:/Users/winth/Documents/KDV/EM2/Face_recognition_experiment/data_271125/data"
+filsti_bertram <- "/Users/bertramgraverblohm/Desktop/EM2/Vores_forsøg/Eksperiment/data"
+filsti_Christo <- "/Users/chris/Library/CloudStorage/GoogleDrive-christoffer.andersen.privat@gmail.com/Andre computere/Christoffers Mac/Google Drev/Uni/3Semester/EM2/Face_reconitions_exp/Data"
+
+# Setting the active path for data loading
+data_mappe <- filsti_Christo
+```
+
+```{r}
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  tidyverse, lme4, lmerTest, emmeans, effectsize, afex, 
+  ggpubr, performance, broom.mixed, car, rstatix, 
+  psych, BayesFactor, stringr, here, gt, dplyr
+)
+```
+
+```{r}
+# Find all files ending with .csv in the folder
+csv_filer <- list.files(path = data_mappe, 
+                        pattern = "*.csv", 
+                        full.names = TRUE)
+
+# Read all files and combine them into one dataframe
+all_data <- map_dfr(csv_filer, read_csv) %>%
+  mutate(correct_num = as.numeric(correct))
+
+
+# --- Data Splitting ---
+
+# Survey data
+survey_data <- all_data %>%
+  filter(str_starts(trial, "survey_")) %>%
+  filter(!participant_id %in% c("1003", "2012")) %>% # Endret linje
+  select(participant_id,
+         mask_type = memory_mask,
+         difficulty_rating = response) %>%
+  mutate(
+    difficulty_rating = as.numeric(difficulty_rating),
+    participant_id = factor(participant_id)
+  )
+
+# Trial data
+all_data_trial <- all_data %>%
+  # Remove trials where RT is over 4 seconds (outlier removal)
+  filter(!is.na(rt) & rt <= 4) %>% 
+  mutate(participant_id = factor(participant_id),
+         memory_mask = factor(memory_mask),
+         probe_mask = factor(probe_mask))
+
+analysis_data <- all_data %>%
+  filter(!str_starts(trial, "survey_")) %>%  # Fjern survey trials
+  filter(!is.na(rt) & rt <= 4) %>%          # Fjern RT outliers (hvis de ikke allerede er fjernet i all_data_trial)
+  mutate(
+    participant_id = factor(participant_id),
+    memory_mask = factor(memory_mask),
+    probe_mask = factor(probe_mask),
+    correct_num = as.numeric(correct),
+    
+    # --- Nye analysevariabler ---
+    
+    # 1. Maskens placering (Memory vs. Probe analyse)
+    mask_location = case_when(
+      memory_mask == "unmasked" & probe_mask != "unmasked" ~ "Probe",
+      memory_mask != "unmasked" & probe_mask == "unmasked" ~ "Memory",
+      memory_mask != "unmasked" & probe_mask != "unmasked" ~ "Both",
+      TRUE ~ "None"
+    ),
+    
+    # 2. Mask Type og Level (Udføres på probe_mask, som du ønskede i din kode)
+    mask_level_probe = str_extract(probe_mask, "\\d$"),
+    mask_level_probe = ifelse(is.na(mask_level_probe), "0", mask_level_probe),
+    mask_level_probe = factor(mask_level_probe, levels = c("0", "1", "2", "3")),
+    
+    mask_type_probe = str_extract(probe_mask, "^[^_]+"),
+    mask_type_probe = ifelse(mask_type_probe == "mouth", "mouth_masked", mask_type_probe),
+    mask_type_probe = factor(mask_type_probe, levels = c("unmasked", "mouth_masked", "gabor", "blurred"))
+  )
+```
+
+
+```{r}
+# ==============================================================================
+# 0. SIKKERHEDS-FUNKTION
+# ==============================================================================
+get_bf_safe <- function(vec, mu_val = 0) {
+  clean_vec <- na.omit(vec)
+  if(length(clean_vec) < 2) return(NA_real_)
+  tryCatch({
+    extractBF(ttestBF(x = clean_vec, mu = mu_val))$bf
+  }, error = function(e) NA_real_)
+}
+
+# ==============================================================================
+# 1. DATA PREP (Samme som før)
+# ==============================================================================
+
+# A. Beregn rå værdier pr. person/maske
+raw_stats <- analysis_data %>%
+  filter(mask_location %in% c("Memory", "Probe")) %>%
+  mutate(
+    mask_active = case_when(mask_location == "Probe" ~ probe_mask, mask_location == "Memory" ~ memory_mask),
+    mask_clean = str_to_lower(str_extract(mask_active, "^[^_]+")),
+    mask_clean = ifelse(mask_clean == "mouth", "mouth_masked", mask_clean)
+  ) %>%
+  filter(!is.na(mask_clean), mask_clean != "unmasked") %>%
+  group_by(participant_id, mask_clean) %>%
+  summarise(
+    mean_rt = mean(rt[correct == TRUE], na.rm = TRUE),
+    mean_acc = mean(correct_num, na.rm = TRUE),
+    hits = sum(correct_num == 1 & probe_in_set == TRUE, na.rm = TRUE),
+    misses = sum(correct_num == 0 & probe_in_set == TRUE, na.rm = TRUE),
+    fas = sum(correct_num == 0 & probe_in_set == FALSE, na.rm = TRUE),
+    crs = sum(correct_num == 1 & probe_in_set == FALSE, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    n_targets = hits + misses, n_lures = fas + crs,
+    hit_rate = (hits + 0.5) / (n_targets + 1),
+    fa_rate = (fas + 0.5) / (n_lures + 1),
+    d_prime = qnorm(hit_rate) - qnorm(fa_rate),
+    criterion_c = -0.5 * (qnorm(hit_rate) + qnorm(fa_rate))
+  )
+
+# B. Subjective Rating
+subj_stats <- survey_data %>%
+  mutate(mask_clean = ifelse(str_detect(mask_type, "mouth"), "mouth_masked", str_to_lower(str_extract(mask_type, "^[^_]+")))) %>%
+  group_by(participant_id, mask_clean) %>%
+  summarise(mean_rating = mean(difficulty_rating, na.rm=TRUE), .groups="drop")
+
+# C. Saml og Z-transformér
+bias_data <- raw_stats %>%
+  inner_join(subj_stats, by = c("participant_id", "mask_clean")) %>%
+  ungroup() %>%
+  mutate(
+    z_subj = as.numeric(scale(mean_rating)),
+    z_acc  = as.numeric(scale(mean_acc)),
+    z_rt   = as.numeric(scale(mean_rt)),
+    z_dp   = as.numeric(scale(d_prime)),
+    
+    # Beregn Bias
+    bias_acc = z_subj - (-z_acc),
+    bias_rt = z_subj - z_rt,
+    bias_dp = z_subj - (-z_dp),
+    bias_c = criterion_c
+  )
+
+# ==============================================================================
+# 2. TABEL DATA (Long Format)
+# ==============================================================================
+
+long_bias_data <- bias_data %>%
+  select(participant_id, mask_clean, bias_acc, bias_rt, bias_dp, bias_c) %>%
+  pivot_longer(cols = starts_with("bias_"), names_to = "Metric", values_to = "Score") %>%
+  mutate(
+    Metric = case_when(
+      Metric == "bias_acc" ~ "ACC",
+      Metric == "bias_rt"  ~ "RT",
+      Metric == "bias_dp"  ~ "d'",
+      Metric == "bias_c"   ~ "C"
+    )
+  )
+
+final_table_data <- long_bias_data %>%
+  group_by(mask_clean, Metric) %>%
+  summarise(
+    Mean_Bias = mean(Score, na.rm = TRUE),
+    bf_obj = list(ttestBF(x = na.omit(Score), mu = 0)), 
+    .groups = "drop"
+  ) %>%
+  mutate(
+    BF10 = map_dbl(bf_obj, ~ extractBF(.x)$bf),
+    mask_clean = str_to_title(str_replace(mask_clean, "_", " ")) # Pæne navne
+  ) %>%
+  select(mask_clean, Metric, Mean_Bias, BF10) # Fjernet Conclusion
+
+# ==============================================================================
+# 3. VIS TABEL (Med farve-striber per maske)
+# ==============================================================================
+
+final_table_data %>%
+  # 1. Sortering: Først Maske, så Metric
+  mutate(
+    Metric = factor(Metric, levels = c("ACC", "RT", "d'", "C"))
+  ) %>%
+  arrange(mask_clean, Metric) %>%
+  
+  gt() %>%
+  
+  # Labels
+  cols_label(
+    mask_clean = "Mask Type",
+    Metric = "Bias Type",
+    Mean_Bias = "Mean Bias",
+    BF10 = "BF10"
+  ) %>%
+  
+  # Formatering
+  fmt_number(columns = c(Mean_Bias, BF10), decimals = 2) %>%
+  
+  # Header
+  tab_header(
+    title = md("**Discrepancy Bias Analysis**"),
+    subtitle = "Bayesian One-Sample t-tests against 0"
+  ) %>%
+  
+  # --- STYLING AF BAGGRUND (Zebra per maske) ---
+  # Gabor er den midterste gruppe (hvis vi sorterer alfabetisk: Blurred, Gabor, Mouth)
+  # Vi farver Gabor rækkerne grå for at skabe kontrast
+  tab_style(
+    style = cell_fill(color = "#F2F2F2"), # Lys grå
+    locations = cells_body(
+      rows = mask_clean == "Gabor"
+    )
+  ) %>%
+  
+  # Fed skrift ved signifikante resultater
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = BF10 > 3 | BF10 < 0.33)
+  ) %>%
+  
+  # Justering af kolonnebredde for pænere look (valgfrit)
+  cols_width(
+    Metric ~ px(200),
+    everything() ~ px(120)
+  )
+```
+
+```{r}
+
+# A. Subjective Data (Ratings)
+survey_means <- survey_data %>%
+  mutate(mask_type = case_when(
+    mask_type == "mouth" ~ "mouth_masked",
+    TRUE ~ mask_type
+  )) %>%
+  mutate(
+    type_clean = str_extract(mask_type, "^[a-zA-Z]+"),
+    level_clean = str_extract(mask_type, "\\d+")
+  ) %>%
+  mutate(level_clean = replace_na(level_clean, "1")) %>%
+  group_by(type_clean, level_clean) %>%
+  summarise(
+    grand_mean_rating = mean(difficulty_rating, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# B. Objective Data (RT & Acc)
+obj_means <- all_data_trial %>%
+  mutate(
+    active_mask = case_when(
+      memory_mask != "unmasked" ~ memory_mask,
+      probe_mask != "unmasked" ~ probe_mask,
+      TRUE ~ "unmasked"
+    )
+  ) %>%
+  filter(active_mask != "unmasked") %>%
+  mutate(
+    type_clean = str_extract(active_mask, "^[a-zA-Z]+"),
+    level_clean = str_extract(active_mask, "\\d+")
+  ) %>%
+  mutate(level_clean = replace_na(level_clean, "1")) %>%
+  group_by(type_clean, level_clean) %>%
+  summarise(
+    grand_mean_acc = mean(correct_num, na.rm = TRUE),
+    grand_mean_rt = mean(rt[correct_num == 1], na.rm = TRUE),
+    .groups = "drop"
+  )
+
+dprime_data <- all_data_trial %>%
+  filter(str_detect(memory_mask, "gabor|blurred|mouth") | str_detect(probe_mask, "gabor|blurred|mouth")) %>%
+  mutate(
+    active_mask = case_when(
+      str_detect(memory_mask, "gabor|blurred|mouth") ~ memory_mask,
+      TRUE ~ probe_mask
+    ),
+    mask_type_group = case_when(
+      str_starts(active_mask, "gabor") ~ "gabor",
+      str_starts(active_mask, "blurred") ~ "blurred",
+      str_starts(active_mask, "mouth") ~ "mouth_masked"
+    ),
+    mask_level = as.numeric(str_extract(active_mask, "\\d$")),
+    
+    # KODNING AF SIGNAL DETECTION TYPE
+    # Vi antager at: probe_in_set == TRUE er Signal, response == "yes" er Ja-svar
+    # Tjek dine data: Hedder response "yes"/"no" eller "1"/"0"? Ret nedenfor hvis nødvendigt.
+    sdt_type = case_when(
+      probe_in_set == TRUE & response == "yes" ~ "Hit",
+      probe_in_set == FALSE & response == "yes" ~ "FalseAlarm",
+      probe_in_set == TRUE & response == "no" ~ "Miss",
+      probe_in_set == FALSE & response == "no" ~ "CorrectRejection"
+    )
+  ) %>%
+  filter(!is.na(mask_level) & !is.na(sdt_type))
+
+dprime_summary <- dprime_data %>%
+  group_by(participant_id, mask_type_group, mask_level) %>%
+  summarise(
+    n_hits = sum(sdt_type == "Hit"),
+    n_fa = sum(sdt_type == "FalseAlarm"),
+    n_signal_trials = sum(probe_in_set == TRUE), # Antal gange probe var der
+    n_noise_trials = sum(probe_in_set == FALSE), # Antal gange probe IKKE var der
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # --- KORREKTION (Log-linear rule) ---
+    # Vi lægger 0.5 til tælleren og 1 til nævneren for at undgå Hit Rate = 1 eller FA Rate = 0
+    # (Hvilket ville give d' = uendelig)
+    hit_rate = (n_hits + 0.5) / (n_signal_trials + 1),
+    fa_rate = (n_fa + 0.5) / (n_noise_trials + 1),
+    
+    # BEREGN D PRIME
+    # d' = Z(HitRate) - Z(FalseAlarmRate)
+    d_prime = qnorm(hit_rate) - qnorm(fa_rate)
+  )
+
+
+# C. SDT Data (d' og C) - Nu inkluderer vi criterion_c
+# Vi sikrer os at vi har 'criterion_c' i dprime_summary, ellers beregner vi det
+if(!"criterion_c" %in% names(dprime_summary)) {
+  dprime_summary <- dprime_summary %>%
+    mutate(criterion_c = -0.5 * (qnorm(hit_rate) + qnorm(fa_rate)))
+}
+
+dprime_means <- dprime_summary %>%
+  mutate(
+    type_clean = str_extract(mask_type_group, "^[a-zA-Z]+"),
+    level_clean = as.character(mask_level)
+  ) %>%
+  group_by(type_clean, level_clean) %>%
+  summarise(
+    grand_mean_dprime = mean(d_prime, na.rm = TRUE),
+    grand_mean_c = mean(criterion_c, na.rm = TRUE), # HER ER TILFØJELSEN
+    .groups = "drop"
+  )
+
+# -------------------------------------------------------------------------
+# STEP 2: MERGE DATA
+# -------------------------------------------------------------------------
+
+analysis_data_pooled <- survey_means %>%
+  inner_join(obj_means, by = c("type_clean", "level_clean")) %>%
+  inner_join(dprime_means, by = c("type_clean", "level_clean"))
+
+# -------------------------------------------------------------------------
+# STEP 3: BAYESIAN CORRELATION ANALYSIS
+# -------------------------------------------------------------------------
+
+run_bayes_cor <- function(y_col, name) {
+  x <- analysis_data_pooled$grand_mean_rating
+  y <- analysis_data_pooled[[y_col]]
+  
+  valid <- complete.cases(x, y)
+  x <- x[valid]
+  y <- y[valid]
+  
+  r_val <- cor(x, y)
+  bf_obj <- correlationBF(x, y)
+  bf_val <- extractBF(bf_obj)$bf
+  
+  data.frame(Measure = name, Pearson_r = r_val, BF10 = bf_val)
+}
+
+# Kør analysen på alle 4 mål
+res_acc <- run_bayes_cor("grand_mean_acc", "Accuracy")
+res_rt <- run_bayes_cor("grand_mean_rt", "Reaction Time")
+res_dp <- run_bayes_cor("grand_mean_dprime", "Sensitivity (d')")
+res_c  <- run_bayes_cor("grand_mean_c", "Bias (Criterion C)") # NY TEST
+
+# Saml resultaterne
+final_results <- bind_rows(res_acc, res_rt, res_dp, res_c) %>%
+  mutate(
+    Evidence = case_when(
+      BF10 > 100 ~ "Extreme Evidence (Link exists)",
+      BF10 > 30  ~ "Very Strong Evidence",
+      BF10 > 10  ~ "Strong Evidence",
+      BF10 > 3   ~ "Moderate Evidence",
+      BF10 > 1   ~ "Anecdotal Evidence",
+      BF10 < 1/3 ~ "Evidence for NO relationship (H0)",
+      TRUE ~ "Inconclusive"
+    ),
+    Direction = case_when(
+      Pearson_r > 0.1 ~ "Positive",
+      Pearson_r < -0.1 ~ "Negative",
+      TRUE ~ "Flat/None"
+    )
+  )
+
+# -------------------------------------------------------------------------
+# STEP 4: GENERER TABEL
+# -------------------------------------------------------------------------
+
+bayes_table <- final_results %>%
+  gt() %>%
+  fmt_number(columns = c(Pearson_r, BF10), decimals = 2) %>%
+  tab_header(
+    title = md("**Metacognitive Awareness: Subjective vs. Objective**"),
+    subtitle = "Bayesian Correlation Analysis (Linear Relationship)"
+  ) %>%
+  cols_label(
+    Measure = "Objective Measure",
+    Pearson_r = "Correlation (r)",
+    BF10 = "Bayes Factor (BF10)",
+    Evidence = "Evidence Strength",
+    Direction = "Direction"
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = BF10 > 3)
+  ) %>%
+  tab_footnote(
+    footnote = "Positive correlation for Bias (C) means higher difficulty rating -> more conservative strategy (more 'No').",
+    locations = cells_body(rows = Measure == "Bias (Criterion C)")
+  )
+
+print(bayes_table)
+```
+

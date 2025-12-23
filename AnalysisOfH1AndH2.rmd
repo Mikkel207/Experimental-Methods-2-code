@@ -1,0 +1,983 @@
+---
+title: "RT and ACC to Mask Grading Comparison"
+author: "Bertram Graver Blohm"
+date: "2025-11-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Diverse filepaths
+filsti_Mikkel <- "C:/Users/winth/Documents/KDV/EM2/Face_recognition_experiment/data_271125/data"
+filsti_bertram <- "/Users/bertramgraverblohm/Desktop/EM2/Vores_forsøg/Eksperiment/data"
+filsti_Christo <- "/Users/chris/Library/CloudStorage/GoogleDrive-christoffer.andersen.privat@gmail.com/Andre computere/Christoffers Mac/Google Drev/Uni/3Semester/EM2/Face_reconitions_exp/Data"
+
+# Setting the active path for data loading
+data_mappe <- filsti_bertram
+```
+
+```{r, message=FALSE}
+# Install missing packages if necessary
+required_packages <- c("tidyverse", "lme4", "lmerTest", "emmeans", "effectsize",
+                       "afex", "ggpubr", "patchwork", "ggridges", "performance",
+                       "broom.mixed", "multcomp", "MBESS", "car", "rstatix", 
+                       "psych", "cowplot", "BayesFactor", "stringr", "here", 
+                       "psych")
+new_packages <- required_packages[!(required_packages %in% installed.packages()[,"Package"])]
+if(length(new_packages)) install.packages(new_packages)
+
+# Load all packages
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(effectsize)
+library(afex)
+library(ggpubr)
+library(patchwork)
+library(performance)
+library(broom.mixed)
+library(car)
+library(rstatix)
+library(psych)
+library(cowplot)
+library(BayesFactor)
+library(stringr)
+library(dplyr)
+library(here)
+library(tidyr)
+library(ez)
+```
+
+```{r, message=FALSE}
+# Find all files ending with .csv in the folder
+csv_filer <- list.files(path = data_mappe, 
+                        pattern = "*.csv", 
+                        full.names = TRUE)
+
+# Read all files and combine them into one dataframe
+all_data <- map_dfr(csv_filer, read_csv) %>%
+  mutate(correct_num = as.numeric(correct))
+
+
+# --- Data Splitting ---
+
+# Survey data
+survey_data <- all_data %>%
+  filter(str_starts(trial, "survey_")) %>%
+  filter(participant_id != "1003") %>% # Exclude a specific ID
+  select(participant_id,
+         mask_type = memory_mask,
+         difficulty_rating = response) %>%
+  mutate(
+    difficulty_rating = as.numeric(difficulty_rating),
+    participant_id = factor(participant_id)
+  )
+
+# Trial data
+all_data_trial <- all_data %>%
+  # Remove trials where RT is over 4 seconds (outlier removal)
+  filter(!is.na(rt) & rt <= 4) %>% 
+  mutate(participant_id = factor(participant_id),
+         memory_mask = factor(memory_mask),
+         probe_mask = factor(probe_mask))
+
+# Create analysis_data based on all_data_trial for compatibility with 'extra' analyses
+analysis_data <- all_data_trial
+
+```
+
+```{r}
+
+analysis_data <- all_data %>%
+  filter(!str_starts(trial, "survey_")) %>%  # Fjern survey trials
+  filter(!is.na(rt) & rt <= 4) %>%          # Fjern RT outliers (hvis de ikke allerede er fjernet i all_data_trial)
+  mutate(
+    participant_id = factor(participant_id),
+    memory_mask = factor(memory_mask),
+    probe_mask = factor(probe_mask),
+    correct_num = as.numeric(correct),
+    
+    # --- Nye analysevariabler ---
+    
+    # 1. Maskens placering (Memory vs. Probe analyse)
+    mask_location = case_when(
+      memory_mask == "unmasked" & probe_mask != "unmasked" ~ "Probe",
+      memory_mask != "unmasked" & probe_mask == "unmasked" ~ "Memory",
+      memory_mask != "unmasked" & probe_mask != "unmasked" ~ "Both",
+      TRUE ~ "None"
+    ),
+    
+    # 2. Mask Type og Level (Udføres på probe_mask, som du ønskede i din kode)
+    mask_level_probe = str_extract(probe_mask, "\\d$"),
+    mask_level_probe = ifelse(is.na(mask_level_probe), "0", mask_level_probe),
+    mask_level_probe = factor(mask_level_probe, levels = c("0", "1", "2", "3")),
+    
+    mask_type_probe = str_extract(probe_mask, "^[^_]+"),
+    mask_type_probe = ifelse(mask_type_probe == "mouth", "mouth_masked", mask_type_probe),
+    mask_type_probe = factor(mask_type_probe, levels = c("unmasked", "mouth_masked", "gabor", "blurred"))
+  )
+
+```
+
+Plot af korrelationer (MEMORY-SET OG PROBE TRIALS POOLED) (svar på hyp 1)
+```{r}
+library(tidyverse) # Sikrer at alle funktioner er loadet
+
+# 1. Forbered data: Saml alt, udtræk tallet (1,2,3) og gør det numerisk
+pooled_data <- analysis_data %>%
+  
+  # Filtrer kun trials, hvor masken kun var i Memory ELLER kun i Probe
+  filter(mask_location %in% c("Memory", "Probe")) %>%
+  
+  mutate(
+    # Bestem navnet på den aktive maske og dermed niveauet/typen
+    active_mask = case_when(
+      mask_location == "Memory" ~ memory_mask,
+      mask_location == "Probe" ~ probe_mask
+    ),
+    
+    # Bestem masketypen (denne variabel bruges som gruppe i hyp. 1/2)
+    mask_type_group = case_when(
+      str_starts(active_mask, "gabor") ~ "gabor",
+      str_starts(active_mask, "blurred") ~ "blurred",
+      str_starts(active_mask, "mouth") ~ "mouth_masked"
+    ),
+    
+    # Udtræk tallet og gør det til en numerisk variabel for lineær test
+    mask_level = as.numeric(str_extract(active_mask, "\\d$"))
+  ) %>%
+  # Fjern alle trials uden en maske/level (f.eks. unmasked i memory eller probe)
+  filter(!is.na(mask_level)) 
+
+# 2. Aggreger data: Vi skal bruge ét punkt pr. deltager pr. niveau
+data_summary <- pooled_data %>%
+  group_by(mask_type_group, mask_level, participant_id) %>%
+  summarise(
+    mean_rt = mean(rt, na.rm = TRUE),
+    mean_accuracy = mean(correct_num, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+# --- 2. Function to calculate correct labels and positions ---
+get_annotation_data <- function(data, y_var_name) {
+  
+  # A. Calculate correlations per group
+  stats <- data %>%
+    group_by(mask_type_group) %>%
+    summarise(
+      r = cor.test(mask_level, !!sym(y_var_name))$estimate,
+      p = cor.test(mask_level, !!sym(y_var_name))$p.value,
+      # Find the highest Y-value in this group to place text above it
+      max_y = max(!!sym(y_var_name), na.rm = TRUE)
+    ) %>%
+    mutate(
+      # Format label text nicely (International format)
+      label = paste0("R = ", round(r, 2), "\n",
+                     "p ", ifelse(p < 0.001, "< .001", paste("=", round(p, 3))))
+    )
+  
+  return(stats)
+}
+
+# --- 3. Plot ACCURACY ---
+
+# Get annotation data specifically for accuracy
+acc_labels <- get_annotation_data(data_summary, "mean_accuracy")
+
+plot_acc <- ggplot(data_summary, aes(x = mask_level, y = mean_accuracy)) +
+  geom_point(aes(color = mask_type_group), alpha = 0.5) +
+  geom_smooth(method = "lm", se = TRUE, color = "black", linewidth = 0.8) +
+  facet_wrap(~ mask_type_group, scales = "free_y") +
+  
+  # Insert text manually based on calculations
+  geom_text(
+    data = acc_labels,
+    aes(x = 2, y = max_y, label = label), # x=2 centers the text
+    vjust = -0.5, # Lift text slightly above max_y
+    size = 4,
+    fontface = "bold"
+  ) +
+  
+  # Expand y-axis by 25% at the top so text fits
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.25))) +
+  scale_x_continuous(breaks = c(1, 2, 3)) +
+  
+  # --- ENGLISH LABELS HERE ---
+  labs(title = "Linear Relationship: Accuracy",
+       x = "Masking Level", 
+       y = "Accuracy") +
+  theme_bw() +
+  theme(legend.position = "none")
+
+print(plot_acc)
+
+# --- 4. Plot REACTION TIME ---
+
+# Get annotation data specifically for RT
+rt_labels <- get_annotation_data(data_summary, "mean_rt")
+
+plot_rt <- ggplot(data_summary, aes(x = mask_level, y = mean_rt)) +
+  geom_point(aes(color = mask_type_group), alpha = 0.5) +
+  geom_smooth(method = "lm", se = TRUE, color = "black", linewidth = 0.8) +
+  facet_wrap(~ mask_type_group, scales = "free_y") +
+  
+  # Insert text
+  geom_text(
+    data = rt_labels,
+    aes(x = 2, y = max_y, label = label),
+    vjust = -0.5,
+    size = 4,
+    fontface = "bold"
+  ) +
+  
+  # Expand y-axis
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.25))) +
+  scale_x_continuous(breaks = c(1, 2, 3)) +
+  
+  # --- ENGLISH LABELS HERE ---
+  labs(title = "Linear Relationship: Reaction Time",
+       x = "Masking Level", 
+       y = "Reaction Time (s)") +
+  theme_bw() +
+  theme(legend.position = "none")
+
+print(plot_rt)
+```
+Mouth-masked korrelerede ikke lineært. Undersøger om performance for mouth_masked holder sig konstant pr. maskeringsgrad (svar på hyp 1)
+```{r}
+# 1. Filtrer data, så vi kun kigger på mouth_masked
+mouth_data <- data_summary %>% 
+  filter(mask_type_group == "mouth_masked") %>% 
+  mutate(mask_level_factor = as.factor(mask_level)) # Gør niveau til en kategori (faktor)
+
+# --- 2. STATISTISK TEST: Repeated Measures ANOVA ---
+# Vi tester: Er der forskel på gennemsnittet mellem niveau 1, 2 og 3?
+# H0 (Nulhypotese): Ingen forskel (performance er konstant)
+
+# Test for ACCURACY
+anova_acc <- aov(mean_accuracy ~ mask_level_factor + Error(participant_id/mask_level_factor), data = mouth_data)
+print("--- ANOVA RESULTATER FOR ACCURACY (Mouth Masked) ---")
+summary(anova_acc)
+
+# Test for REACTION TIME
+anova_rt <- aov(mean_rt ~ mask_level_factor + Error(participant_id/mask_level_factor), data = mouth_data)
+print("--- ANOVA RESULTATER FOR RT (Mouth Masked) ---")
+summary(anova_rt)
+
+# --- 3. VISUALISERING: Boxplot med mean + errorbars ---
+# Dette viser fordelingen bedre end et scatterplot, når vi ikke leder efter en linje
+
+# Plot for Accuracy
+p_mouth_acc <- ggplot(mouth_data, aes(x = mask_level_factor, y = mean_accuracy)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.3, fill = "lightblue") + # Viser spredningen
+  geom_jitter(width = 0.1, alpha = 0.4, color = "darkblue") + # Viser de enkelte deltagere
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.1, color = "red", size = 1) + 
+  stat_summary(fun = mean, geom = "point", color = "red", size = 3) +
+  labs(title = "Mouth Masked: Accuracy per Level",
+       subtitle = "Røde punkter viser gennemsnit +/- Standard Error",
+       x = "Masking Level (1-3)",
+       y = "Accuracy") +
+  theme_bw()
+
+# Plot for RT
+p_mouth_rt <- ggplot(mouth_data, aes(x = mask_level_factor, y = mean_rt)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.3, fill = "lightgreen") +
+  geom_jitter(width = 0.1, alpha = 0.4, color = "darkgreen") +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.1, color = "red", size = 1) + 
+  stat_summary(fun = mean, geom = "point", color = "red", size = 3) +
+  labs(title = "Mouth Masked: Reaction Time per Level",
+       subtitle = "Røde punkter viser gennemsnit +/- Standard Error",
+       x = "Masking Level (1-3)",
+       y = "Reaction Time (s)") +
+  theme_bw()
+
+# Vis plots
+print(p_mouth_acc)
+print(p_mouth_rt)
+```
+Konstant er mouth_masked heller ikke. Undersøger hvilke niveauer der er forskellige fra hinanden. Og hvis der er nogen, om en kvadratisk model kan forklare mouth masked data (svar på hyp 1)
+```{r}
+
+
+# Post-hoc test for Accuracy (Mouth Masked)
+# Vi bruger 'bonferroni' korrektion for at være konservative og undgå falske positiver
+pairwise.t.test(mouth_data$mean_accuracy, 
+                mouth_data$mask_level, 
+                p.adjust.method = "bonferroni",
+                paired = TRUE) # Husk paired = TRUE, da det er within-subjects
+
+# Undersøger om der er kvadratisk sammenhæng
+
+# 1. Opret den kvadratiske variabel (mask_level^2) i dit datasæt
+mouth_data_quad <- mouth_data %>%
+  mutate(mask_level_sq = mask_level^2)
+
+# 2. Fit to modeller for ACCURACY
+
+# Model 1: Lineær effekt (som i din første korrelation)
+model_linear <- lmer(mean_accuracy ~ mask_level + (1 | participant_id), 
+                     data = mouth_data_quad)
+
+# Model 2: Kvadratisk effekt (inkluderer mask_level^2)
+model_quadratic <- lmer(mean_accuracy ~ mask_level + mask_level_sq + (1 | participant_id), 
+                        data = mouth_data_quad)
+
+# 3. Sammenlign modellerne
+print("--- SAMMENLIGNING AF LINEÆR VS. KVADRATISK MODEL (Accuracy) ---")
+anova(model_linear, model_quadratic)
+
+# 4. Se på den kvadratiske models koefficienter (hvis den er bedre)
+print("--- KVADRATISK MODEL SUMMARY ---")
+summary(model_quadratic)
+
+# PLOT DEN KVADRATISKE SAMMENHÆNG
+
+# --- Data er filtreret som før ---
+mouth_data_plot <- data_summary %>% 
+  filter(mask_type_group == "mouth_masked")
+
+# --- Plot-kode uden annotationer ---
+plot_quadratic_acc_clean <- ggplot(mouth_data_plot, aes(x = mask_level, y = mean_accuracy)) +
+  
+  # Scatter-punkter
+  geom_point(alpha = 0.6, size = 3, color = "darkred") + 
+  
+  # Kvadratisk regressionslinje (Omvendt U-form)
+  geom_smooth(method = "lm", 
+              formula = y ~ poly(x, 2), 
+              se = TRUE, 
+              color = "black", 
+              linewidth = 1.2) +
+  
+  # Sikre at x-aksen kun viser 1, 2 og 3
+  scale_x_continuous(breaks = c(1, 2, 3), labels = c("Level 1", "Level 2", "Level 3")) +
+  
+  # Tilføj labels
+  labs(title = "Accuracy",
+       x = "Masking Level",
+       y = "Mean Accuracy (pr. participant)") +
+  
+  theme_bw()
+
+# Vis det færdige plot
+print(plot_quadratic_acc_clean)
+```
+Er maskerne svære end baseline? (svar på hyp 1)
+```{r}
+
+# --- ANTAGE DATAFRAMEN KALDES 'all_data_trial' OG ER FULDT INDLÆST ---
+
+# 1. Standardiser og opret maskeringskategorier
+df_cleaned <- all_data_trial %>%
+  # Sørg for at 'participant_id' er en faktor
+  mutate(participant_id = factor(participant_id)) %>%
+  # Opret kategoriseringskolonnen:
+  mutate(
+    # Specifikke Maskeringsniveauer (f.eks. gabor_1, blurred_3, mouth_masked_2)
+    specific_level = case_when(
+      str_detect(memory_mask, "_") ~ memory_mask,
+      str_detect(probe_mask, "_") ~ probe_mask,
+      # Tjek for baseline
+      memory_mask == "unmasked" & probe_mask == "unmasked" ~ "unmasked",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  # Filtrer rækker, hvor vi ikke kunne identificere et relevant niveau
+  filter(!is.na(specific_level))
+
+# 2. Aggreger data for Specifikke Niveauer (mean_rt og mean_acc pr. deltager/niveau)
+df_summary_specific <- df_cleaned %>%
+  group_by(participant_id, specific_level) %>%
+  summarise(
+    mean_rt = mean(rt, na.rm = TRUE),
+    mean_acc = mean(correct_num, na.rm = TRUE), # Brug correct_num
+    .groups = 'drop'
+  )
+
+print("--- ⏳ RT: Specifikke Maskeringsniveauer (vs. Unmasked) ---")
+
+# Parvise t-tests med Bonferroni korrektion
+rt_specific_pwc <- df_summary_specific %>%
+  pairwise_t_test(
+    mean_rt ~ specific_level,
+    ref.group = "unmasked",
+    paired = TRUE,
+    p.adjust.method = "bonferroni"
+  )
+
+# VIS FULDT OUTPUT FOR AT UNDGÅ KOLONNEFEJL:
+rt_specific_pwc
+
+print("--- ✅ ACC: Specifikke Maskeringsniveauer (vs. Unmasked) ---")
+
+# Parvise t-tests med Bonferroni korrektion
+acc_specific_pwc <- df_summary_specific %>%
+  pairwise_t_test(
+    mean_acc ~ specific_level,
+    ref.group = "unmasked",
+    paired = TRUE,
+    p.adjust.method = "bonferroni"
+  )
+
+# VIS FULDT OUTPUT FOR AT UNDGÅ KOLONNEFEJL:
+acc_specific_pwc
+
+# --- DEN ENDELIGE KODE MED PRÆCIS BEREGNING START ---
+# Vi antager, at du har adgang til de to dataframes:
+# 1. analysis_data (den rå data, som du sendte)
+# 2. pooled_data (det filtrerede data, som du lige beskrev)
+
+# BEREGNING AF BASELINE (Trin 1)
+# Vi bruger analysis_data for at finde RT for den Umaskerede betingelse
+# (Dette skal kun køres, hvis du har adgang til analysis_data)
+# Sørg for at analysis_data har fået den samme RT-filtrering som du brugte i din startkode!
+baseline_value_exact <- analysis_data %>%
+  # Vigtigt: Genanvend RT-filtrering:
+  filter(!is.na(rt) & rt <= 4) %>%
+  # Filtrér for forsøg, hvor BEGGE masker er 'unmasked'
+  filter(memory_mask == "unmasked" & probe_mask == "unmasked") %>%
+  summarise(y = mean(rt, na.rm = TRUE)) %>%
+  pull(y)
+
+# -----------------------------------------------------------------
+
+
+# 2. Opret mean_rt_detailed fra DIN FILTREREDE pooled_data (som før)
+mean_rt_detailed <- pooled_data %>%
+  mutate(mask_level = factor(mask_level)) %>%
+  group_by(mask_type_group, mask_level) %>%
+  summarise(
+    mean_rt = mean(rt, na.rm = TRUE),
+    se_rt = sd(rt, na.rm = TRUE) / sqrt(n()),
+    n = n(),
+    .groups = 'drop'
+  )
+
+# Opret et nyt dataframe KUN til baseline linjen
+baseline_df <- data.frame(y = baseline_value_exact)
+
+
+# 3. Generer Søjlediagrammet med Uafhængig Baseline Linje
+rt_final_plot <- ggplot(mean_rt_detailed, 
+                        aes(x = mask_level, 
+                            y = mean_rt, 
+                            fill = mask_type_group)) +
+  
+  # Tilføj grupperede søjler
+  geom_bar(stat = "identity", 
+           position = position_dodge(width = 0.9), 
+           color = "black") +
+  
+  # Tilføj fejl-bjælker
+  geom_errorbar(aes(ymin = mean_rt - se_rt, 
+                    ymax = mean_rt + se_rt),
+                width = 0.2, 
+                position = position_dodge(0.9)) +
+  
+  # BRUGER DET UAFHÆNGIGE BASELINE DATAFRAME HER
+  geom_hline(aes(yintercept = y),
+             data = baseline_df, # Fortæller geom_hline at bruge sit eget data
+             linetype = "dashed", 
+             color = "red", 
+             size = 1.2) +
+  
+  # Titler og Labels
+  labs(
+    title = "Gennemsnitlig Reaktionstid efter Maskeringstype og Grad (vs. Baseline)",
+    subtitle = paste0("Stiplet rød linje: Baseline (RT for 'Unmasked' = ", 
+                      round(baseline_value_exact, 3), " sekunder)"),
+    x = "Mask level",
+    y = "Mean Reaction Time",
+    fill = "Mask type"
+  ) +
+  
+  # Styling
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5)
+  )
+
+# Udskriv plottet
+print(rt_final_plot)
+
+# --- ACCURACY ANALYSE KODE START ---
+
+# Vi antager, at 'pooled_data' og 'analysis_data' er loadet
+
+## 1. Beregn Baseline Værdi for Nøjagtighed (ACC)
+# Baseline ACC: Gennemsnitlig nøjagtighed for trials hvor memory_mask OG probe_mask er "unmasked"
+
+baseline_acc_exact <- analysis_data %>%
+  # Vigtigt: Genanvend RT-filtrering (hvis det er nødvendigt for konsistens):
+  filter(!is.na(rt) & rt <= 4) %>%
+  # Filtrér for forsøg, hvor BEGGE masker er 'unmasked'
+  filter(memory_mask == "unmasked" & probe_mask == "unmasked") %>%
+  # Beregn gennemsnitlig nøjagtighed (mean af correct_num)
+  summarise(y = mean(correct_num, na.rm = TRUE)) %>%
+  pull(y)
+
+# Opret et nyt dataframe KUN til ACC baseline linjen
+baseline_acc_df <- data.frame(y = baseline_acc_exact)
+
+
+## 2. Aggreger data for Nøjagtighed (ACC)
+# Beregn gennemsnitlig ACC og Standard Error (SE) for hver Type/Grad i pooled_data
+mean_acc_detailed <- pooled_data %>%
+  mutate(mask_level = factor(mask_level)) %>%
+  group_by(mask_type_group, mask_level) %>%
+  summarise(
+    mean_accuracy = mean(correct_num, na.rm = TRUE), # Den nye metrik
+    se_accuracy = sd(correct_num, na.rm = TRUE) / sqrt(n()),
+    n = n(),
+    .groups = 'drop'
+  )
+
+## 3. Generer Søjlediagram for Nøjagtighed
+acc_final_plot <- ggplot(mean_acc_detailed, 
+                         aes(x = mask_level, 
+                             y = mean_accuracy, 
+                             fill = mask_type_group)) +
+  
+  # Tilføj grupperede søjler
+  geom_bar(stat = "identity", 
+           position = position_dodge(width = 0.9), 
+           color = "black") +
+  
+  # Tilføj fejl-bjælker (Standard Error)
+  geom_errorbar(aes(ymin = mean_accuracy - se_accuracy, 
+                    ymax = mean_accuracy + se_accuracy),
+                width = 0.2, 
+                position = position_dodge(0.9)) +
+  
+  # Tilføj ACC Baseline Linje (fra uafhængigt dataframe)
+  geom_hline(aes(yintercept = y),
+             data = baseline_acc_df, 
+             linetype = "dashed", 
+             color = "red", 
+             size = 1.2) +
+  
+  # Titler og Labels
+  labs(
+    title = "Gennemsnitlig Nøjagtighed efter Maskeringstype og Grad (vs. Baseline)",
+    subtitle = paste0("Stiplet blå linje: Baseline Nøjagtighed = ", 
+                      round(baseline_acc_exact, 3)),
+    x = "Mask level",
+    y = "Mean Accuracy",
+    fill = "Mask type"
+  ) +
+  
+  # Sætter Y-aksen fra 0 til 1 for at repræsentere en proportion korrekt
+  ylim(0, 1) + 
+  
+  # Styling
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5))
+
+# Udskriv plottet
+print(acc_final_plot)
+
+# --- ACCURACY ANALYSE KODE SLUT ---
+library(gt)
+library(dplyr)
+library(stringr)
+
+# 1. Dataforberedelse
+stats_combined <- rt_specific_pwc %>%
+  select(level = group2, p_rt = p, p.adj_rt = p.adj, stars_rt = p.adj.signif) %>%
+  left_join(
+    acc_specific_pwc %>% 
+      select(level = group2, p_acc = p, p.adj_acc = p.adj, stars_acc = p.adj.signif),
+    by = "level"
+  )
+
+table_data <- df_summary_specific %>%
+  filter(specific_level != "unmasked") %>%
+  group_by(specific_level) %>%
+  summarise(
+    Mean_RT = mean(mean_rt, na.rm = TRUE),
+    Mean_ACC = mean(mean_acc, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  left_join(stats_combined, by = c("specific_level" = "level")) %>%
+  mutate(
+    clean_name = str_to_sentence(str_replace_all(specific_level, "_", " ")),
+    mask_type = str_to_title(str_remove(str_replace_all(specific_level, "_", " "), "\\s\\d+$")),
+    is_sig_rt = p.adj_rt < 0.05,
+    is_sig_acc = p.adj_acc < 0.05
+  ) %>%
+  mutate(across(contains("p_") | contains("p.adj_"), ~ {
+    ifelse(.x < 0.001, "< .001", as.character(sprintf("%.3f", round(.x, 3))))
+  }))
+
+# 2. Lav gt-tabellen
+summary_table_final <- table_data %>%
+  group_by(mask_type) %>%
+  gt() %>%
+  # RYKKER CONDITION TIL START
+  cols_move_to_start(columns = clean_name) %>%
+  
+  tab_header(
+    title = md("**Statistical Summary: Masking Effects vs. Baseline**"),
+    subtitle = "Reaction Time (RT) in seconds and Accuracy (ACC) proportion"
+  ) %>%
+  tab_spanner(label = "Reaction Time (RT)", columns = c(Mean_RT, p_rt, p.adj_rt, stars_rt)) %>%
+  tab_spanner(label = "Accuracy (ACC)", columns = c(Mean_ACC, p_acc, p.adj_acc, stars_acc)) %>%
+  
+  # Venstrestilling
+  cols_align(
+    align = "left",
+    columns = everything()
+  ) %>%
+  
+  # Afstand og bredde
+  cols_width(
+    clean_name ~ px(160),
+    contains("Mean") ~ px(100),
+    contains("p_") ~ px(80),
+    contains("p.adj") ~ px(80),
+    contains("stars") ~ px(50)
+  ) %>%
+  
+  fmt_number(columns = contains("Mean"), decimals = 3) %>%
+  cols_hide(columns = c(is_sig_rt, is_sig_acc, specific_level)) %>%
+  
+  cols_label(
+    clean_name = "Condition",
+    Mean_RT = "Mean",
+    p_rt = "p",
+    p.adj_rt = "p.adj",
+    stars_rt = "Sig.",
+    Mean_ACC = "Mean",
+    p_acc = "p",
+    p.adj_acc = "p.adj",
+    stars_acc = "Sig."
+  ) %>%
+  
+  # Styling for signifikans
+  tab_style(
+    style = cell_text(weight = "bold", color = "#1a5e96"),
+    locations = cells_body(columns = stars_rt, rows = is_sig_rt == TRUE)
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold", color = "#1a5e96"),
+    locations = cells_body(columns = stars_acc, rows = is_sig_acc == TRUE)
+  ) %>%
+  
+  tab_options(
+    row_group.background.color = "#f4f4f4",
+    table.width = pct(100),
+    data_row.padding = px(6)
+  )
+
+# Vis tabellen
+summary_table_final
+
+# Gem som PNG
+gtsave(summary_table_final, "Hypothesis_1_Table.png", zoom = 2)
+```
+
+
+Analyser om raten, hvormed gabor og blurred stiger/falder er signifikant forskellige for hinanden (afviger hældningen de linæere regressioner signifikant fra hinanden?) (svar på hyp 2)
+```{r}
+library(lme4)     # Til at køre mixed-effects modellen
+library(lmerTest) # Til at få p-værdier (ANOVA-tabeller)
+library(dplyr)
+
+# Vi skal kun bruge data fra Gabor og Blurred
+comparison_data_summary <- data_summary %>%
+  filter(mask_type_group %in% c("gabor", "blurred")) %>%
+  # Sikrer at deltager-ID er behandlet som en faktor (nødvendigt for LMM)
+  mutate(participant_id = factor(participant_id))
+
+# --- Model 1: Nøjagtighed (Accuracy) ---
+cat("--- Model 1: Nøjagtighed - Sammenligning af Hældninger ---\n")
+
+# Modelstruktur: mean_accuracy forudsagt af MaskLevel, MaskType og deres interaktion, 
+# med ParticipantID som random effect (random intercept)
+model_acc <- lmer(
+  mean_accuracy ~ mask_level * mask_type_group + (1 | participant_id),
+  data = comparison_data_summary
+)
+
+# Vis ANOVA-tabellen for at teste interaktionstermen
+anova_acc <- anova(model_acc)
+print(anova_acc)
+
+# --- Model 2: Reaktionstid (RT) ---
+cat("\n\n--- Model 2: Reaktionstid - Sammenligning af Hældninger ---\n")
+
+# Modelstruktur for RT
+model_rt <- lmer(
+  mean_rt ~ mask_level * mask_type_group + (1 | participant_id),
+  data = comparison_data_summary
+)
+
+# Vis ANOVA-tabellen for at teste interaktionstermen
+anova_rt <- anova(model_rt)
+print(anova_rt)
+```
+
+Analyser sammenhængen mellem d' og maskeringsgrad (svar til hyp 1)
+```{r}
+
+# 1. Forbered data (Samme pooling som før)
+dprime_data <- all_data_trial %>%
+  filter(str_detect(memory_mask, "gabor|blurred|mouth") | str_detect(probe_mask, "gabor|blurred|mouth")) %>%
+  mutate(
+    active_mask = case_when(
+      str_detect(memory_mask, "gabor|blurred|mouth") ~ memory_mask,
+      TRUE ~ probe_mask
+    ),
+    mask_type_group = case_when(
+      str_starts(active_mask, "gabor") ~ "gabor",
+      str_starts(active_mask, "blurred") ~ "blurred",
+      str_starts(active_mask, "mouth") ~ "mouth_masked"
+    ),
+    mask_level = as.numeric(str_extract(active_mask, "\\d$")),
+    
+    # KODNING AF SIGNAL DETECTION TYPE
+    # Vi antager at: probe_in_set == TRUE er Signal, response == "yes" er Ja-svar
+    # Tjek dine data: Hedder response "yes"/"no" eller "1"/"0"? Ret nedenfor hvis nødvendigt.
+    sdt_type = case_when(
+      probe_in_set == TRUE & response == "yes" ~ "Hit",
+      probe_in_set == FALSE & response == "yes" ~ "FalseAlarm",
+      probe_in_set == TRUE & response == "no" ~ "Miss",
+      probe_in_set == FALSE & response == "no" ~ "CorrectRejection"
+    )
+  ) %>%
+  filter(!is.na(mask_level) & !is.na(sdt_type))
+
+# 2. Beregn d-prime
+dprime_summary <- dprime_data %>%
+  group_by(participant_id, mask_type_group, mask_level) %>%
+  summarise(
+    n_hits = sum(sdt_type == "Hit"),
+    n_fa = sum(sdt_type == "FalseAlarm"),
+    n_signal_trials = sum(probe_in_set == TRUE), # Antal gange probe var der
+    n_noise_trials = sum(probe_in_set == FALSE), # Antal gange probe IKKE var der
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # --- KORREKTION (Log-linear rule) ---
+    # Vi lægger 0.5 til tælleren og 1 til nævneren for at undgå Hit Rate = 1 eller FA Rate = 0
+    # (Hvilket ville give d' = uendelig)
+    hit_rate = (n_hits + 0.5) / (n_signal_trials + 1),
+    fa_rate = (n_fa + 0.5) / (n_noise_trials + 1),
+    
+    # BEREGN D PRIME
+    # d' = Z(HitRate) - Z(FalseAlarmRate)
+    d_prime = qnorm(hit_rate) - qnorm(fa_rate)
+  )
+
+# Se de første rækker
+head(dprime_summary)
+
+# Beregn korrelationer og saml i en dataframe
+dprime_results <- dprime_summary %>%
+  group_by(mask_type_group) %>%
+  summarise(
+    Pearson_R = cor.test(mask_level, d_prime, method = "pearson")$estimate,
+    P_Value = cor.test(mask_level, d_prime, method = "pearson")$p.value,
+    max_dprime = max(d_prime, na.rm = TRUE), # Bruges til plotting
+    .groups = "drop"
+  ) %>%
+  # Formater label til plotting
+  mutate(
+    label = paste0("R = ", round(Pearson_R, 2), "\n",
+                   "p ", ifelse(P_Value < 0.001, "< .001", paste("=", round(P_Value, 3))))
+  )
+
+print(dprime_results)
+  
+library(ggplot2)
+
+# Sammenflet dprime_summary med de beregnede labels (dprime_results) for plotting
+plot_data <- left_join(dprime_summary, dprime_results, by = "mask_type_group")
+
+plot_dprime <- ggplot(plot_data, aes(x = mask_level, y = d_prime)) +
+  geom_point(aes(color = mask_type_group), alpha = 0.5) +
+  geom_smooth(method = "lm", se = TRUE, color = "black", linewidth = 0.8) +
+  facet_wrap(~ mask_type_group, scales = "free_y") +
+  
+  # Indsæt de korrekte labels (R og p-værdi)
+  geom_text(
+    data = dprime_results,
+    aes(x = 2, y = max_dprime, label = label), 
+    vjust = -0.5,
+    size = 4,
+    fontface = "bold"
+  ) +
+  
+  # VIGTIGT: Udvid y-aksen for at give plads til labels
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.25))) +
+  scale_x_continuous(breaks = c(1, 2, 3)) +
+  
+  labs(title = "Linear Relationship: Sensitivity (d-prime)",
+       x = "Masking Level", y = "d-prime (Sensitivity)") +
+  theme_bw() +
+  theme(legend.position = "none")
+
+print(plot_dprime)
+```
+
+Analyse af raten (hældningen) af d' afviger mellem blurred og gabor (svar på hyp 2)
+```{r}
+# 1. Forbered Data (filtrer Gabor og Blurred)
+dprime_comparison <- dprime_summary %>%
+  filter(mask_type_group %in% c("gabor", "blurred")) %>%
+  mutate(participant_id = factor(participant_id))
+
+# 2. Kør LMM
+# Model: d_prime forudsagt af MaskLevel, MaskType og deres interaktion, 
+# med ParticipantID som random effect.
+cat("--- LMM Analyse af d' (Sensitivitet) ---\n")
+model_dprime <- lmer(
+  d_prime ~ mask_level * mask_type_group + (1 | participant_id),
+  data = dprime_comparison
+)
+
+# 3. Vis ANOVA-tabellen for at teste interaktionstermen
+anova_dprime <- anova(model_dprime)
+print(anova_dprime)
+```
+Der er altså ikke forskel i d' men i ACC. Skyldes det forskelle i svarstrategier? Vi undersøger dette. Først ved at bekræfte linearitet og derefter LLM. (svar på hyp 2)
+```{r}
+
+# Antager, at dprime_summary (med hit_rate og fa_rate) er klar
+bias_summary <- dprime_summary %>%
+  mutate(
+    # C = -0.5 * (Z(HitRate) + Z(FalseAlarmRate))
+    criterion_c = -0.5 * (qnorm(hit_rate) + qnorm(fa_rate))
+  )
+
+# Beregn korrelationer og saml i en dataframe
+c_results <- bias_summary %>%
+  group_by(mask_type_group) %>%
+  summarise(
+    Pearson_R = cor.test(mask_level, criterion_c, method = "pearson")$estimate,
+    P_Value = cor.test(mask_level, criterion_c, method = "pearson")$p.value,
+    max_c = max(criterion_c, na.rm = TRUE), # Bruges til plotting
+    .groups = "drop"
+  ) %>%
+  # Formater label til plotting
+  mutate(
+    label = paste0("R = ", round(Pearson_R, 2), "\n",
+                   "p ", ifelse(P_Value < 0.001, "< .001", paste("=", round(P_Value, 3))))
+  )
+
+print(c_results)
+
+# Plot korrelation for C
+
+# 1. Beregn Korrelationer og saml i en dataframe for tekstlabels
+c_results <- bias_summary %>%
+  group_by(mask_type_group) %>%
+  summarise(
+    Pearson_R = cor.test(mask_level, criterion_c, method = "pearson")$estimate,
+    P_Value = cor.test(mask_level, criterion_c, method = "pearson")$p.value,
+    # Find maksimum C for at placere labels korrekt i plottet
+    max_c = max(criterion_c, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  # Formater label (R og p-værdi)
+  mutate(
+    label = paste0("R = ", round(Pearson_R, 2), "\n",
+                   "p ", ifelse(P_Value < 0.001, "< .001", paste("=", round(P_Value, 3))))
+  )
+
+# 2. Sammenflet data og lav plottet
+plot_data_c <- left_join(bias_summary, c_results, by = "mask_type_group")
+
+plot_bias_corr <- ggplot(plot_data_c, aes(x = mask_level, y = criterion_c)) +
+  
+  # Scatter plots
+  geom_point(aes(color = mask_type_group), alpha = 0.5) +
+  
+  # Lineær regressionslinje (hældning = korrelation)
+  geom_smooth(method = "lm", se = TRUE, color = "black", linewidth = 0.8) +
+  
+  # Vandret linje ved C = 0 (Neutral Bias)
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  
+  # Adskil plotterne for hver masketype
+  facet_wrap(~ mask_type_group, scales = "free_y") +
+  
+  # Indsæt de beregnede R og p-værdier i hvert facet
+  geom_text(
+    data = c_results,
+    aes(x = 2.5, y = max_c, label = label), 
+    vjust = -0.5,
+    size = 4,
+    fontface = "bold"
+  ) +
+  
+  # Aksejusteringer
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.25))) +
+  scale_x_continuous(breaks = c(1, 2, 3)) +
+  
+  labs(title = "Lineær Sammenhæng: Response Bias (C) vs. Maskeringsgrad",
+       subtitle = "Positiv C (> 0) indikerer konservativ bias",
+       x = "Maskeringsgrad", y = "Bias (C)") +
+  
+  theme_bw() +
+  theme(legend.position = "none")
+
+# Udskriv plottet
+print(plot_bias_corr)
+
+# Se de første rækker af den nye dataframe, der indeholder C
+head(bias_summary)
+
+# Filtrer kun Gabor og Blurred
+bias_comparison <- bias_summary %>%
+  filter(mask_type_group %in% c("gabor", "blurred")) %>%
+  mutate(participant_id = factor(participant_id))
+
+cat("--- LMM Analyse af Response Bias (C) ---\n")
+model_bias <- lmer(
+  criterion_c ~ mask_level * mask_type_group + (1 | participant_id),
+  data = bias_comparison
+)
+
+anova_bias <- anova(model_bias)
+print(anova_bias)
+
+# OG PLOT DET
+
+# Aggregate C data for plotting mean trends
+plot_c_trend <- bias_summary %>%
+  group_by(mask_type_group, mask_level) %>%
+  summarise(
+    mean_c = mean(criterion_c, na.rm = TRUE),
+    se_c = sd(criterion_c, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+plot_bias <- ggplot(plot_c_trend, aes(x = mask_level, y = mean_c, color = mask_type_group, group = mask_type_group)) +
+  
+  geom_errorbar(aes(ymin = mean_c - se_c, ymax = mean_c + se_c), width = 0.15, position = position_dodge(width = 0.2)) +
+  geom_point(position = position_dodge(width = 0.2), size = 3) +
+  geom_line(position = position_dodge(width = 0.2), linewidth = 1) +
+  
+  # Horizontal line at C = 0 (Neutral Bias)
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  
+  scale_x_continuous(breaks = c(1, 2, 3)) +
+  
+  labs(title = "Response Bias (C) vs. Masking Level",
+       x = "Masking Level", 
+       y = "Mean Bias (C)",
+       color = "Mask Type") +
+  
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(plot_bias)
+```
+
